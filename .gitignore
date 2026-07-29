@@ -1,0 +1,15 @@
+# Secrets: real keys live only in untracked .env files
+.env
+
+# Local data cache (SQLite), rebuildable from APIs
+data/
+*.sqlite
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
