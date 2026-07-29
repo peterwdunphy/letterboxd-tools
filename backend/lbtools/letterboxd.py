@@ -23,7 +23,13 @@ from dataclasses import dataclass, field
 from curl_cffi import requests
 
 BASE = "https://letterboxd.com"
-IMPERSONATE = "chrome"
+
+# Which browser TLS fingerprint gets through depends on the client's IP
+# reputation: from a residential IP Chrome is fine, but from a datacenter IP
+# (the droplet) Cloudflare challenges Chrome and Firefox on deep pagination
+# and the diary while Safari passes cleanly. Verified 2026-07-28. So try a
+# chain and stick with whichever profile works for this process.
+IMPERSONATE_CHAIN = ("safari184", "safari260", "chrome", "firefox144")
 THROTTLE_SECONDS = 0.6
 RETRIES = 3
 MAX_PAGES_HARD = 200          # ~14k films; stops runaway crawls
@@ -77,37 +83,72 @@ class UserData:
 
 
 _session = None
+_profile_idx = 0
 _last_fetch = 0.0
 
 
-def _fetch(url):
-    """Throttled browser-fingerprinted GET with retries."""
-    global _session, _last_fetch
+def current_profile():
+    return IMPERSONATE_CHAIN[_profile_idx]
+
+
+def _session_for_current():
+    global _session
     if _session is None:
-        _session = requests.Session(impersonate=IMPERSONATE)
-    for attempt in range(RETRIES):
+        _session = requests.Session(impersonate=current_profile())
+    return _session
+
+
+def _next_profile():
+    """Switch to the next TLS fingerprint. False when the chain is spent."""
+    global _profile_idx, _session
+    if _profile_idx + 1 >= len(IMPERSONATE_CHAIN):
+        return False
+    _profile_idx += 1
+    _session = None
+    return True
+
+
+def _fetch(url):
+    """Throttled GET with a browser TLS fingerprint.
+
+    On a Cloudflare challenge, rotates to the next fingerprint in the chain
+    and retries rather than failing, since which one passes depends on the
+    host's IP reputation.
+    """
+    global _last_fetch
+    attempt = 0
+    while attempt < RETRIES:
+        session = _session_for_current()
         wait = THROTTLE_SECONDS - (time.time() - _last_fetch)
         if wait > 0:
             time.sleep(wait)
         _last_fetch = time.time()
         try:
-            resp = _session.get(url, timeout=30)
+            resp = session.get(url, timeout=30)
         except Exception:
-            if attempt == RETRIES - 1:
+            attempt += 1
+            if attempt >= RETRIES:
                 raise
-            time.sleep(2 * (attempt + 1))
+            time.sleep(2 * attempt)
             continue
         if resp.status_code == 404:
             user = url.split("/")[3] if len(url.split("/")) > 3 else url
             raise ProfileNotFound(
                 f"No public Letterboxd profile for '{user}'. "
                 f"Check the spelling, or the profile may be private.")
-        if resp.status_code in (429, 502, 503) and attempt < RETRIES - 1:
-            time.sleep(5 * (attempt + 1))
-            continue
         body = resp.text
-        if "Just a moment..." in body[:2000]:
-            raise ChallengeError(f"Cloudflare challenge at {url}")
+        challenged = "Just a moment..." in body[:2000]
+        if challenged or resp.status_code == 403:
+            if _next_profile():
+                continue                # same URL, different fingerprint
+            raise ChallengeError(
+                f"Cloudflare challenged every TLS profile at {url}")
+        if resp.status_code in (429, 502, 503):
+            attempt += 1
+            if attempt >= RETRIES:
+                raise RuntimeError(f"HTTP {resp.status_code} at {url}")
+            time.sleep(5 * attempt)
+            continue
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code} at {url}")
         return body
