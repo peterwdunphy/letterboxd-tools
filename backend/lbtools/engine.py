@@ -59,10 +59,11 @@ def keyword_communities(metas, df, n, min_count=3, iterations=8):
     for _ in range(iterations):
         changed = 0
         for k in sorted(vocab):
-            if not co[k]:
+            neighbors = co.get(k)      # a keyword can co-occur with nothing
+            if not neighbors:
                 continue
             votes = Counter()
-            for neighbor, w in co[k].items():
+            for neighbor, w in neighbors.items():
                 votes[label[neighbor]] += w
             votes[label[k]] += 1                     # slight self-stickiness
             new = min(votes, key=lambda c: (-votes[c], c))   # deterministic tie-break
@@ -187,12 +188,23 @@ def quality_prior(meta):
     return max(0.0, min(1.0, (bayes - 5.0) / 3.0))
 
 
+def norm_title(s):
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
 def score_candidates(profile, cand_metas, ctx, seed_hits=None,
-                     require_released=True, exclude_ids=frozenset()):
-    """Ranked [(score, meta, reasons)] for candidate films."""
+                     require_released=True, exclude_ids=frozenset(),
+                     exclude_titles=frozenset()):
+    """Ranked [(score, meta, reasons)] for candidate films.
+
+    exclude_titles holds normalized titles of everything the user has
+    watched or watchlisted: same-title different-year entries (remakes,
+    TMDB duplicates like Cleopatra 1934 vs 1963) read as 'you recommended
+    what I just watched', so they are filtered even though the ids differ.
+    """
     out = []
     for tid, meta in cand_metas.items():
-        if tid in exclude_ids:
+        if tid in exclude_ids or norm_title(meta.get("title")) in exclude_titles:
             continue
         if require_released and not released(meta):
             continue
@@ -206,6 +218,70 @@ def score_candidates(profile, cand_metas, ctx, seed_hits=None,
         out.append((s, meta, _reasons(profile, vec)))
     out.sort(key=lambda t: -t[0])
     return out
+
+
+def score_group(profiles, cand_metas, ctx, watched_keys, watchlist_keys,
+                title_index, seen_weight=0.0, seed_hits=None,
+                require_released=True, languages=None, availability=None):
+    """Rank candidates for a group of users.
+
+    profiles         {username: taste vector}
+    watched_keys     {username: set of film keys they have logged}
+    watchlist_keys   {username: set of film keys on their watchlist}
+    title_index      {normalized title: film key} for candidate matching
+    seen_weight      0 = drop anything anyone has seen, 1 = seen is fine
+    languages        keep only these original_language codes (None = all)
+    availability     'flatrate' | 'any' | None  (streaming filter)
+    """
+    users = list(profiles)
+    out = []
+    for tid, meta in cand_metas.items():
+        if require_released and not released(meta):
+            continue
+        if (meta.get("vote_count") or 0) < 20:
+            continue
+        if languages and meta.get("original_language") not in languages:
+            continue
+        provs = meta.get("providers", {})
+        if availability == "flatrate" and not provs.get("flatrate"):
+            continue
+        if availability == "any" and not any(provs.get(k) for k in
+                                             ("flatrate", "rent", "buy")):
+            continue
+        key = title_index.get(norm_title(meta.get("title")))
+        seen_by = [u for u in users if key and key in watched_keys[u]]
+        if seen_by and seen_weight <= 0.01:
+            continue
+        wants = [u for u in users if key and key in watchlist_keys[u]]
+
+        vec = _norm(film_vector(meta, ctx))
+        sims = {u: cosine(profiles[u], vec) for u in users}
+        mean = sum(sims.values()) / len(users)
+        worst = min(sims.values())
+        # Reward broad appeal but protect the least-served person: a film
+        # three people love and one hates is a bad group pick.
+        base = 0.6 * mean + 0.4 * worst
+        base *= 1 + 0.25 * len(wants) / len(users)      # on their watchlists
+        if seen_by:
+            base *= seen_weight ** (len(seen_by) / len(users))
+        s = base * (0.6 + 0.4 * quality_prior(meta)) \
+                 * (1 + 0.05 * min((seed_hits or {}).get(tid, 0), 8))
+        out.append({
+            "score": s, "meta": meta,
+            "seen_by": seen_by, "wants": wants,
+            "per_user": {u: round(sims[u], 4) for u in users},
+            "reasons": _reasons_multi(profiles, film_vector(meta, ctx)),
+        })
+    out.sort(key=lambda d: -d["score"])
+    return out
+
+
+def _reasons_multi(profiles, vec):
+    avg = defaultdict(float)
+    for p in profiles.values():
+        for k, x in p.items():
+            avg[k] += x / len(profiles)
+    return _reasons(avg, vec)
 
 
 def _reasons(profile, vec):

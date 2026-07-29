@@ -1,32 +1,42 @@
-"""Scrape a Letterboxd user's public watchlist, watched films, and RSS diary.
+"""Scrape a Letterboxd user's public watchlist, watched films, and diary.
 
-All fetches are throttled (Letterboxd is not rate-limit-friendly territory)
-and use a browser User-Agent. Grid pages carry ~28 (watchlist) or ~72
-(films) posters per page with machine-readable data attributes.
+Requests go through curl_cffi with a Chrome TLS fingerprint. Letterboxd
+sits behind Cloudflare, which fingerprints the TLS handshake rather than
+checking JavaScript: a stdlib urllib/curl handshake gets 403 on deep
+pagination and the diary, while a browser-shaped handshake gets the same
+public pages a logged-out browser sees. Same pages, same throttling, no
+challenge solving and no authentication.
+
+Sources per user:
+  /watchlist/          every page  -> films they want to see
+  /films/              every page  -> every film they have logged
+  /diary/films/        every page  -> watch DATES, ratings, likes, rewatches
+  /rss/                one request -> TMDB ids for the last ~50 (saves lookups)
 """
 
 import html
 import re
 import time
-import urllib.request
-import urllib.error
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-BASE = "https://letterboxd.com"
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-THROTTLE_SECONDS = 1.2
-RETRIES = 3
+from curl_cffi import requests
 
-RSS_NS = {
-    "letterboxd": "https://letterboxd.com",
-    "tmdb": "https://themoviedb.org",
-}
+BASE = "https://letterboxd.com"
+IMPERSONATE = "chrome"
+THROTTLE_SECONDS = 0.6
+RETRIES = 3
+MAX_PAGES_HARD = 200          # ~14k films; stops runaway crawls
+
+RSS_NS = {"letterboxd": "https://letterboxd.com", "tmdb": "https://themoviedb.org"}
 
 
 class ChallengeError(RuntimeError):
     """Cloudflare served a bot-challenge page instead of content."""
+
+
+class ProfileNotFound(RuntimeError):
+    """No such Letterboxd user, or their profile is private."""
 
 
 @dataclass
@@ -34,10 +44,11 @@ class Film:
     slug: str
     title: str
     year: int | None
-    tmdb_id: int | None = None          # only RSS provides this directly
-    watched_date: str | None = None     # ISO date, RSS/export only
-    rating: float | None = None         # 0.5-5.0, RSS/export only
+    tmdb_id: int | None = None
+    watched_date: str | None = None     # ISO date, diary/export only
+    rating: float | None = None         # 0.5-5.0
     liked: bool = False
+    rewatch: bool = False
     rank: int = 0                       # position in the source listing
     uri: str | None = None              # boxd.it link (export files only)
 
@@ -59,41 +70,46 @@ def _norm_title(s):
 class UserData:
     username: str
     watchlist: list[Film] = field(default_factory=list)
-    watched: list[Film] = field(default_factory=list)
-    recent: list[Film] = field(default_factory=list)   # RSS diary, newest first
-    # Cloudflare blocks */films/page/N (site-wide WAF rule, verified
-    # 2026-07-28), so scraped watched history is capped at grid page 1 +
-    # RSS. These fields say how much of the user's history that covers.
-    watched_est_total: int = 0          # ~pages * 72 from the paginator
-    history_complete: bool = False      # True when export supplied or 1-page user
+    watched: list[Film] = field(default_factory=list)   # complete, dated where known
+    diary: list[Film] = field(default_factory=list)     # dated entries, newest first
+    history_complete: bool = True
+    watched_est_total: int = 0
 
 
+_session = None
 _last_fetch = 0.0
 
 
 def _fetch(url):
-    """Throttled GET with retries. Raises ChallengeError on a Cloudflare page."""
-    global _last_fetch
+    """Throttled browser-fingerprinted GET with retries."""
+    global _session, _last_fetch
+    if _session is None:
+        _session = requests.Session(impersonate=IMPERSONATE)
     for attempt in range(RETRIES):
         wait = THROTTLE_SECONDS - (time.time() - _last_fetch)
         if wait > 0:
             time.sleep(wait)
-        req = urllib.request.Request(url, headers={
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
         _last_fetch = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = resp.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 502, 503) and attempt < RETRIES - 1:
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise
+            resp = _session.get(url, timeout=30)
+        except Exception:
+            if attempt == RETRIES - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+            continue
+        if resp.status_code == 404:
+            user = url.split("/")[3] if len(url.split("/")) > 3 else url
+            raise ProfileNotFound(
+                f"No public Letterboxd profile for '{user}'. "
+                f"Check the spelling, or the profile may be private.")
+        if resp.status_code in (429, 502, 503) and attempt < RETRIES - 1:
+            time.sleep(5 * (attempt + 1))
+            continue
+        body = resp.text
         if "Just a moment..." in body[:2000]:
             raise ChallengeError(f"Cloudflare challenge at {url}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code} at {url}")
         return body
     raise RuntimeError(f"unreachable: {url}")
 
@@ -104,72 +120,91 @@ _GRID_TAG = re.compile(r'<div[^>]*data-item-slug="[^"]+"[^>]*>')
 _ITEM_ATTR = re.compile(r'data-item-(slug|name)="([^"]*)"')
 _NAME_YEAR = re.compile(r"^(?P<title>.*?)\s*\((?P<year>\d{4})\)$")
 _PAGE_NUM = re.compile(r"/page/(\d+)/")
+_DIARY_ROW = re.compile(r'<tr class="diary-entry-row.*?</tr>', re.S)
+_DIARY_DATE = re.compile(r"/for/(\d{4})/(\d{2})/(\d{2})/")
+_RATED = re.compile(r"rated-(\d+)")
+
+
+def _split_name(name):
+    name = html.unescape(name)
+    m = _NAME_YEAR.match(name)
+    return (m.group("title"), int(m.group("year"))) if m else (name, None)
 
 
 def _parse_grid(body, start_rank):
     films = []
     for m in _GRID_TAG.finditer(body):
         attrs = dict(_ITEM_ATTR.findall(m.group(0)))
-        name = html.unescape(attrs.get("name", ""))   # &amp; &#039; etc.
-        ym = _NAME_YEAR.match(name)
-        title, year = (ym.group("title"), int(ym.group("year"))) if ym else (name, None)
+        title, year = _split_name(attrs.get("name", ""))
         films.append(Film(slug=attrs["slug"], title=title, year=year,
                           rank=start_rank + len(films)))
     return films
 
 
-def _crawl_grid(username, section, max_pages=None, progress=None):
-    """Fetch every page of a grid section ('watchlist' or 'films')."""
-    films, page, total_pages = [], 1, 1
-    while page <= total_pages and (max_pages is None or page <= max_pages):
+def _crawl(path, parser, max_pages=None, progress=None, label=""):
+    """Fetch every page of a paginated section."""
+    items, page, total = [], 1, 1
+    cap = min(max_pages or MAX_PAGES_HARD, MAX_PAGES_HARD)
+    while page <= total and page <= cap:
         suffix = "" if page == 1 else f"page/{page}/"
-        body = _fetch(f"{BASE}/{username}/{section}/{suffix}")
+        body = _fetch(f"{BASE}{path}{suffix}")
         if page == 1:
             nums = _PAGE_NUM.findall(body)
-            total_pages = max(int(n) for n in nums) if nums else 1
-        films.extend(_parse_grid(body, start_rank=len(films)))
+            total = max(int(n) for n in nums) if nums else 1
+        items.extend(parser(body, len(items)))
         if progress:
-            progress(section, page, min(total_pages, max_pages or total_pages))
+            progress(label, page, min(total, cap))
         page += 1
-    return films
+    return items
 
 
 def get_watchlist(username, max_pages=None, progress=None):
-    return _crawl_grid(username, "watchlist", max_pages, progress)
+    return _crawl(f"/{username}/watchlist/", _parse_grid, max_pages,
+                  progress, "watchlist")
 
 
-def get_watched_sample(username):
-    """Watched films, page 1 only: ~72 films.
-
-    Two hard limits, both verified 2026-07-28: deeper pages 403 behind a
-    Cloudflare WAF rule matching */films/page/N, and the grid's default
-    order is RELEASE DATE (newest first), with every /by/ sorted view
-    (including by/date = watch order) also 403. So this is a sample of
-    the user's newest-released watched films, useful for membership and
-    taste but NOT for recency. True watch dates come only from the RSS
-    diary (get_recent) and the export ZIP (export.py).
-
-    Returns (films, est_total, is_complete).
-    """
-    body = _fetch(f"{BASE}/{username}/films/")
-    films = _parse_grid(body, start_rank=0)
-    nums = _PAGE_NUM.findall(body)
-    pages = max(int(n) for n in nums) if nums else 1
-    per_page = len(films)
-    est_total = per_page if pages == 1 else (pages - 1) * per_page + per_page // 2
-    return films, est_total, pages == 1
+def get_watched(username, max_pages=None, progress=None):
+    """Every film the user has logged, all pages (release-date order)."""
+    return _crawl(f"/{username}/films/", _parse_grid, max_pages,
+                  progress, "watched films")
 
 
-def get_recent(username):
-    """Parse the RSS diary feed: last ~100 entries, newest first.
+def _parse_diary(body, start_rank):
+    entries = []
+    for m in _DIARY_ROW.finditer(body):
+        row = m.group(0)
+        attrs = dict(_ITEM_ATTR.findall(row))
+        if "slug" not in attrs:
+            continue
+        title, year = _split_name(attrs.get("name", ""))
+        d = _DIARY_DATE.search(row)
+        rating = _RATED.search(row)
+        entries.append(Film(
+            slug=attrs["slug"], title=title, year=year,
+            watched_date=f"{d.group(1)}-{d.group(2)}-{d.group(3)}" if d else None,
+            rating=int(rating.group(1)) / 2 if rating else None,
+            liked="icon-liked" in row,
+            rewatch="icon-rewatch" in row and "icon-rewatch-off" not in row,
+            rank=start_rank + len(entries),
+        ))
+    return entries
 
-    Watch entries carry watchedDate, rating, and a real TMDB id. List
-    entries (letterboxd:filmTitle absent) are skipped.
-    """
-    body = _fetch(f"{BASE}/{username}/rss/")
-    root = ET.fromstring(body.encode())
+
+def get_diary(username, max_pages=None, progress=None):
+    """Dated watch log, newest first, all pages."""
+    return _crawl(f"/{username}/diary/films/", _parse_diary, max_pages,
+                  progress, "diary")
+
+
+def get_recent_rss(username):
+    """Last ~50 diary entries with TMDB ids attached (one cheap request)."""
+    try:
+        body = _fetch(f"{BASE}/{username}/rss/")
+        root = ET.fromstring(body.encode())
+    except Exception:
+        return []
     films = []
-    for rank, item in enumerate(root.iter("item")):
+    for item in root.iter("item"):
         def txt(tag, ns="letterboxd"):
             el = item.find(f"{{{RSS_NS[ns]}}}{tag}")
             return el.text if el is not None else None
@@ -178,13 +213,10 @@ def get_recent(username):
             continue
         link = item.findtext("link") or ""
         slug_m = re.search(r"/film/([^/]+)/", link)
-        tmdb_el = txt("movieId", ns="tmdb")
-        year = txt("filmYear")
-        rating = txt("memberRating")
+        tmdb_el, year, rating = txt("movieId", ns="tmdb"), txt("filmYear"), txt("memberRating")
         films.append(Film(
             slug=slug_m.group(1) if slug_m else "",
-            title=title,
-            year=int(year) if year else None,
+            title=title, year=int(year) if year else None,
             tmdb_id=int(tmdb_el) if tmdb_el else None,
             watched_date=txt("watchedDate"),
             rating=float(rating) if rating else None,
@@ -195,38 +227,41 @@ def get_recent(username):
 
 
 def get_user(username, max_pages=None, progress=None, export_watched=None):
-    """Everything we can grab for one user.
+    """Complete public picture of one user.
 
-    Watched history = films grid page 1 (recently added) merged with the
-    RSS diary (dated + rated), deduped by slug. If export_watched (a list
-    of Films from export.py) is supplied, it replaces the scraped history
-    entirely and marks the profile complete.
+    Watched history = the full films grid, enriched with diary dates,
+    ratings, and likes wherever the diary covers a film. Films logged
+    without a diary entry (bulk-imported history) stay undated and are
+    treated as background taste by the engine.
     """
     data = UserData(username=username)
-    data.recent = get_recent(username)
     data.watchlist = get_watchlist(username, max_pages, progress)
-    grid, data.watched_est_total, complete = get_watched_sample(username)
-    if progress:
-        progress("films (page 1 only, see WAF note)", 1, 1)
+    grid = get_watched(username, max_pages, progress)
+    data.diary = get_diary(username, max_pages, progress)
+    rss = get_recent_rss(username)
 
-    by_slug = {f.slug: f for f in data.recent if f.slug}
-    for f in grid:                       # backfill RSS detail onto grid films
-        r = by_slug.get(f.slug)
-        if r:
-            f.watched_date, f.rating = r.watched_date, r.rating
-            f.tmdb_id, f.liked = r.tmdb_id, r.liked
+    latest = {}                     # slug -> newest diary entry
+    for f in data.diary:
+        if f.slug and f.slug not in latest:
+            latest[f.slug] = f
+    tmdb_by_slug = {f.slug: f.tmdb_id for f in rss if f.slug and f.tmdb_id}
+
+    merged = {}
+    for f in grid:
+        d = latest.get(f.slug)
+        if d:
+            f.watched_date, f.rating = d.watched_date, d.rating
+            f.liked, f.rewatch = d.liked, d.rewatch
+        f.tmdb_id = tmdb_by_slug.get(f.slug)
+        merged[f.key] = f
+    for f in data.diary:            # diary-only films (rare, but keep them)
+        merged.setdefault(f.key, f)
 
     if export_watched is not None:
-        merged = {f.key: f for f in export_watched}
-        for f in grid + data.recent:     # scraped data is fresher than the export
-            merged[f.key] = f
-        data.watched = list(merged.values())
-        data.history_complete = True
-        data.watched_est_total = len(data.watched)
-    else:
-        merged = {f.slug: f for f in grid}
-        for f in data.recent:
-            merged.setdefault(f.slug, f)
-        data.watched = list(merged.values())
-        data.history_complete = complete
+        for f in export_watched:
+            merged.setdefault(f.key, f)
+
+    data.watched = list(merged.values())
+    data.watched_est_total = len(data.watched)
+    data.history_complete = True
     return data

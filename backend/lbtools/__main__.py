@@ -27,9 +27,9 @@ def _load_user(args):
         export_watched=export_watched)
     print()
     enriched, misses = tmdb.enrich_films(data.watched + data.watchlist)
+    dated = sum(1 for f in data.watched if f.watched_date)
     print(f"  watchlist {len(data.watchlist)} | watched {len(data.watched)}"
-          f"{' (complete)' if data.history_complete else f' (sample of ~{data.watched_est_total})'}"
-          f" | enriched {len(enriched)}, unresolved {len(misses)}")
+          f" ({dated} dated) | enriched {len(enriched)}, unresolved {len(misses)}")
     return data, enriched
 
 
@@ -57,8 +57,11 @@ def cmd_recommend(args):
     profile, _ = engine.taste_profile(
         data.watched, data.watchlist, enriched, ctx,
         recency=args.recency, source=args.source)
+    own_titles = {engine.norm_title(f.title)
+                  for f in data.watched + data.watchlist}
     ranked = engine.score_candidates(profile, cand_metas, ctx,
-                                     seed_hits=seed_hits)
+                                     seed_hits=seed_hits,
+                                     exclude_titles=own_titles)
 
     print(f"\nTop {args.n} recommendations for {args.username} "
           f"(recency={args.recency}, source={args.source}):\n")
@@ -85,13 +88,10 @@ def cmd_profile(args):
     data = letterboxd.get_user(args.username, max_pages=args.max_pages,
                                progress=grid_progress,
                                export_watched=export_watched)
-    coverage = ("complete" if data.history_complete
-                else f"sample: {len(data.watched)} of ~{data.watched_est_total} "
-                     f"(newest releases + dated RSS; export ZIP unlocks full history)")
+    dated = sum(1 for f in data.watched if f.watched_date)
     print(f"\n  watchlist: {len(data.watchlist)} films"
-          f" | watched: {len(data.watched)} films [{coverage}]"
-          f" | RSS diary: {len(data.recent)} entries"
-          f" ({sum(1 for f in data.recent if f.tmdb_id)} with TMDB ids)")
+          f" | watched: {len(data.watched)} films ({dated} with watch dates)"
+          f" | diary entries: {len(data.diary)}")
 
     to_enrich = (data.watched + data.watchlist)[:args.enrich] if args.enrich \
         else data.watched + data.watchlist

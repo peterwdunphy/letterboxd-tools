@@ -17,11 +17,11 @@ Both display poster, title, year, hyperlinked to the film's Letterboxd page.
 |---|---|---|
 | Official API (api.letterboxd.com) | Application-only | Email api@letterboxd.com with intended use. Free, OAuth2, covers watchlists, ratings, diary, lists. No guaranteed reply. **Apply on day 1 anyway**; this is exactly the hobbyist use case they exist for, and it is the only fully sanctioned path. |
 | `letterboxd.com/{user}/watchlist/` (HTML) | **Works** with a browser User-Agent | ~28 films/page, paginated (`/page/N/`). Each film exposes `data-target-link="/film/{slug}/"` and an `<img alt="Title">`. robots.txt does NOT disallow user watchlist/films pages for generic crawlers (it blocks only sort/genre/stats views and named AI crawlers). |
-| `letterboxd.com/{user}/films/` (HTML) | **Page 1 only, release-date order** | Grid of ~72 watched films sorted by RELEASE date (newest first), not watch date. Pages 2+ return 403: a site-wide Cloudflare WAF rule blocks any `*/films/page/N` URL, and every `/by/` sorted view (including `by/date`, the watch-order sort) is 403 even on page 1 (verified 2026-07-28 from two IPs; referer, cookies, XHR headers, and `?page=` all fail). Consequences: full watched history is NOT scrapable, and scraped watch **recency** comes only from RSS; the grid sample contributes membership/taste, not order. |
+| `letterboxd.com/{user}/films/` (HTML) | **Fully scrapable, every page** | ~72 films/page in release-date order. Deep pages 403 for plain HTTP clients, but not for a browser-shaped TLS handshake — see the curl_cffi note below. |
 | `letterboxd.com/{user}/rss/` | **Works, no bot challenge** | Last ~50 diary entries with `letterboxd:watchedDate`, member rating, and crucially `tmdb:movieId`. This is the recency signal, and it hands us TMDB IDs for free. |
-| `letterboxd.com/{user}/films/diary/` (HTML) | **403** (Cloudflare challenge) | Blocked even with browser UA. Do not build on this. |
+| `letterboxd.com/{user}/diary/films/` (HTML) | **Fully scrapable, every page** | 50 entries/page: watch DATE, star rating, liked flag, rewatch flag. This is the real recency and ratings source at any depth. |
 | `/film/{slug}/json/` and `/csi/film/{slug}/stats/` | **403** (Cloudflare challenge) | The "appears in N lists" count lives behind these. Treat list-overlap counts as a stretch goal (via official API if granted, or headless browser + aggressive caching). |
-| User data export ZIP | Manual but complete | Settings → Data → Export gives `watched.csv` (with dates), `watchlist.csv`, `ratings.csv`, `diary.csv`. Zero scraping risk. **Promoted from fallback to first-class**: it is the only source of complete watch history (see WAF row above), so the UI offers an optional "upload your export ZIP" step; without it, tools run on the ~100-170 scrapable recent films and say so. Implemented in `backend/lbtools/export.py`. |
+| User data export ZIP | Optional, for private profiles only | Settings → Data → Export. Now needed **only** when a profile is private, since public profiles scrape completely. Implemented in `backend/lbtools/export.py`, parsed in memory and never stored. |
 
 **Honesty note on scraping**: Letterboxd's TOS discourages automated access. The mitigations are: low volume (one user's pages per request), 1 req/sec throttle, 24h caching per username, RSS-first, the export-upload alternative, and a pending official API application. If they grant API access, the scraper gets deleted.
 
@@ -47,7 +47,19 @@ The site (`~/Dropbox/website`) is static HTML deployed to Cloudflare Workers sta
 - Backend: Python FastAPI service on the **same DigitalOcean droplet** as the AMC API, served at a new subdomain (e.g. `boxd-api.peterwdunphy.com`, DNS + reverse proxy config mirroring whatever amc-api uses), CORS locked to peterwdunphy.com.
 - Cache: SQLite file on the droplet (one file, no database server).
 
-One risk to test early: Letterboxd's Cloudflare protection may challenge the droplet's datacenter IP harder than a residential one. Mitigations: `curl-cffi` browser impersonation, 24h per-user caching, RSS-first, and the export-upload fallback. Phase 1 tests scraping from the droplet before anything is built on top.
+### The curl_cffi finding (2026-07-28) — this unlocked everything
+
+Cloudflare here fingerprints the **TLS handshake**, not JavaScript. Python's
+urllib and plain curl have handshakes that read as "not a browser", which is why
+deep pagination and the diary returned 403 while page 1 worked. `curl_cffi` with
+`impersonate="chrome"` replays Chrome's exact handshake, and every one of those
+endpoints returns 200 — same public pages, no challenge solving, no login, no
+headless browser. (Headless Chrome was tested and *fails*: Cloudflare detects
+automation. The TLS route is both simpler and more reliable.)
+
+Consequence: full watched history, full diary with real dates and ratings, and
+full watchlists are all scrapable for any public profile. The export ZIP dropped
+from "required for accuracy" to "only for private profiles".
 
 ---
 
@@ -94,7 +106,7 @@ Per Peter (2026-07-28): the tool pages should be **immersive and beautiful**, a 
 
 ### Phase 1: Data layer (the foundation, ~a weekend)
 **DONE 2026-07-28.** Python package `backend/lbtools/` (stdlib only, no pip installs needed on the droplet):
-- `letterboxd.py`: watchlist (all pages), watched grid (page 1, WAF-capped), RSS diary, merged into a `UserData` with coverage flags.
+- `letterboxd.py`: watchlist, watched films, and diary — all pages, via curl_cffi — merged into one `UserData`. RSS is kept as a cheap source of TMDB ids for recent films.
 - `export.py`: full watch history + ratings + dates from the export ZIP.
 - `tmdb.py` + `cache.py`: slug→TMDB resolution, one-call enrichment (details, keywords, credits, US watch providers), permanent SQLite cache.
 - CLI: `python3 -m lbtools profile <username> [--export zip] [--max-pages N] [--enrich N]` prints an enriched taste summary. Verified end-to-end on a real user; TV specials correctly unresolved (movies only).
@@ -103,12 +115,13 @@ Per Peter (2026-07-28): the tool pages should be **immersive and beautiful**, a 
 - Feature vectors, keyword→theme community detection, taste profiles, candidate generation, scoring with the three weights as function parameters.
 - Deliverable: CLI spits out top-25 recommendations for you, and for you+a friend. Eyeball tuning happens here, it is the fun part.
 
-### Phase 3: Tool 1 live (~a weekend)
+### Phase 3: Tool 1 live — **DONE 2026-07-28**
 - FastAPI: `POST /api/enrich {username, recency_weight, watched_vs_watchlist}` returning JSON film cards. Long-running scrapes stream progress via SSE or simple polling of a job ID (the AMC watcher's `api()` helper pattern in `js/movie-watcher.js` carries over).
 - `letterboxd-enrich.html` on the site: username field, two sliders, results grid (poster, title, year, Letterboxd link), built from the existing `.tool-form` components. Cache by username so slider changes re-rank instantly without re-scraping.
+- Optional "full history" step: link the user to [letterboxd.com/settings/data](https://letterboxd.com/settings/data/) with one-line instructions (request export → download ZIP → upload here), a file input that POSTs the ZIP, parsed in memory by `export.py` and never written to disk. Without it the tool runs on the scrapable sample (~72 grid + ~50 RSS films) and the UI says so.
 - Deploy backend to the DigitalOcean droplet at `boxd-api.peterwdunphy.com`, CORS to peterwdunphy.com, per-IP rate limit.
 
-### Phase 4: Tool 2 live (~a weekend)
+### Phase 4: Tool 2 live — **DONE 2026-07-28**
 - `POST /api/group {usernames[], weights, seen_penalty, language, availability}` reusing everything from Phase 3.
 - `what-should-we-watch.html`: add-user chips (2 to 8), extra controls, watchlist-intersection section, provider logos, JustWatch + TMDB attribution footer. Both pages added to the Tools nav dropdown in every HTML file (the site has no templating) and to `sitemap.xml`.
 
