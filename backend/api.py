@@ -84,7 +84,7 @@ class EnrichRequest(BaseModel):
     username: str
     recency: float = Field(0.5, ge=0, le=1)
     source: float = Field(0.35, ge=0, le=1)
-    limit: int = Field(40, ge=1, le=100)
+    limit: int = Field(40, ge=1, le=200)
 
 
 class GroupRequest(BaseModel):
@@ -95,7 +95,7 @@ class GroupRequest(BaseModel):
     seen_weight: float = Field(0.0, ge=0, le=1)
     languages: list[str] | None = None
     availability: str | None = None          # 'flatrate' | 'any' | None
-    limit: int = Field(40, ge=1, le=100)
+    limit: int = Field(40, ge=1, le=200)
 
 
 @app.get("/api/health")

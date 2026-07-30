@@ -80,38 +80,75 @@ def keyword_communities(metas, df, n, min_count=3, iterations=8):
 
 # ---------------------------------------------------------------- vectors
 
-FEATURE_WEIGHTS = {"genre": 2.0, "theme": 1.5, "kw": 1.0, "dir": 2.5,
-                   "act": 1.0, "lang": 0.5, "dec": 0.75}
+BLOCK_NORM = 0.25
+
+# "Animation" lumps Grave of the Fireflies in with Captain Underpants, so
+# the coarse genre tag carries less weight than what a film is actually
+# about (its themes and keywords), who made it, and what language it is
+# in — the things that separate arthouse animation from kids' fare.
+FEATURE_WEIGHTS = {"genre": 1.3, "theme": 2.0, "kw": 1.3, "dir": 2.5,
+                   "act": 1.0, "lang": 1.1, "dec": 0.75}
 
 
 def _raw_features(meta, communities):
-    """Type-weighted features before corpus IDF is applied."""
+    """Unweighted features, grouped by type."""
     v = {}
     for g in meta.get("genres", []):
-        v[f"genre:{g}"] = FEATURE_WEIGHTS["genre"]
+        v[f"genre:{g}"] = 1.0
     for k in meta.get("keywords", []):
-        v[f"kw:{k}"] = FEATURE_WEIGHTS["kw"]
+        v[f"kw:{k}"] = 1.0
         c = communities.get(k)
         if c:
             key = f"theme:{c}"
-            v[key] = min(v.get(key, 0) + FEATURE_WEIGHTS["theme"],
-                         2 * FEATURE_WEIGHTS["theme"])
+            v[key] = min(v.get(key, 0) + 1.0, 2.0)
     for d in meta.get("directors", []):
-        v[f"dir:{d}"] = FEATURE_WEIGHTS["dir"]
+        v[f"dir:{d}"] = 1.0
     for a in meta.get("cast", []):
-        v[f"act:{a}"] = FEATURE_WEIGHTS["act"]
+        v[f"act:{a}"] = 1.0
     if meta.get("original_language"):
-        v[f"lang:{meta['original_language']}"] = FEATURE_WEIGHTS["lang"]
+        v[f"lang:{meta['original_language']}"] = 1.0
     rd = meta.get("release_date") or ""
     if len(rd) >= 4:
-        v[f"dec:{rd[:3]}0s"] = FEATURE_WEIGHTS["dec"]
+        v[f"dec:{rd[:3]}0s"] = 1.0
     return v
 
 
+def _soft_idf(x):
+    """Compress IDF into [0.35, 1].
+
+    Raw IDF scored 'Drama' at 0.08 and 'Animation' at 0.26, so a plain
+    drama arrived nearly featureless while anything animated carried three
+    times the weight. Rare features should count for more, not for
+    everything.
+    """
+    return 0.35 + 0.65 * x
+
+
 def film_vector(meta, ctx):
+    """Feature vector with each TYPE normalized to the same total mass.
+
+    Without per-type normalization, films that carry many genres beat
+    films that carry few, regardless of taste: a kids' animation tagged
+    Animation/Family/Comedy/Adventure/Fantasy/Sci-Fi hits six profile
+    dimensions at once while a drama hits one. That is a property of TMDB's
+    tagging conventions, not of what anyone likes to watch.
+    """
     communities, feat_idf = ctx
-    return {f: w * feat_idf.get(f, 0.6)
-            for f, w in _raw_features(meta, communities).items()}
+    raw = _raw_features(meta, communities)
+    blocks = {}
+    for f, w in raw.items():
+        kind = f.split(":", 1)[0]
+        blocks.setdefault(kind, {})[f] = w * _soft_idf(feat_idf.get(f, 0.6))
+    out = {}
+    for kind, feats in blocks.items():
+        mag = math.sqrt(sum(x * x for x in feats.values())) or 1.0
+        # BLOCK_NORM interpolates between "more tags = more weight" (0.0,
+        # which floods results with genre-dense kids animation) and full
+        # normalization (1.0, which floods them with single-genre drama).
+        scale = FEATURE_WEIGHTS.get(kind, 1.0) / (mag ** BLOCK_NORM)
+        for f, x in feats.items():
+            out[f] = x * scale
+    return out
 
 
 def _norm(v):
@@ -179,6 +216,9 @@ def released(meta, today=None):
     return bool(rd) and rd <= (today or date.today().isoformat())
 
 
+MIN_VOTES = 250        # below this, TMDB scores are noise
+
+
 def quality_prior(meta):
     """0..1 from TMDB ratings, Bayesian-shrunk toward the global mean so
     a 9.0 from 30 votes doesn't beat an 8.1 from 20,000."""
@@ -188,13 +228,94 @@ def quality_prior(meta):
     return max(0.0, min(1.0, (bayes - 5.0) / 3.0))
 
 
+def taste_level(metas):
+    """The quality bar the user actually watches at, as a prior value."""
+    if not metas:
+        return 0.5
+    vals = sorted(quality_prior(m) for m in metas)
+    return vals[len(vals) // 2]
+
+
+def level_fit(meta, level):
+    """Penalize films well below the user's usual bar, and don't reward
+    films far above it either. Recommending Minions to someone whose
+    animation diet is Ghibli is a quality mismatch, not a genre one."""
+    gap = quality_prior(meta) - level
+    if gap >= 0:
+        return 1.0
+    return max(0.35, 1.0 + 2.2 * gap)          # falls off below their bar
+
+
 def norm_title(s):
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
 
+def genre_mix(metas, weights=None):
+    """Share of viewing per genre. Each film splits one unit across its
+    genres, so a six-genre kids film doesn't count six times."""
+    mix = defaultdict(float)
+    total = 0.0
+    for m in metas:
+        gs = m.get("genres") or []
+        if not gs:
+            continue
+        w = 1.0 if weights is None else weights.get(m["tmdb_id"], 1.0)
+        for g in gs:
+            mix[g] += w / len(gs)
+        total += w
+    return {g: v / total for g, v in mix.items()} if total else {}
+
+
+def calibrate(ranked, target, limit, lam=0.6):
+    """Greedy re-rank so the selected set's genre mix tracks the user's.
+
+    Pure cosine ranking collapses onto whatever the profile's densest
+    dimension is: it returned 100% Drama for a viewer who watches 44%
+    Drama, and before that 48% Animation for one who watches 20%. Both are
+    the same failure — the ranking optimizes per-film similarity with no
+    notion of what the *set* should look like. This is the standard
+    calibrated-recommendation fix (Steck 2018): at each step, pick the
+    film that best trades off its own score against how far it pushes the
+    running genre mix away from the target.
+
+    lam=0 reproduces the raw ranking; higher values track the mix harder.
+    """
+    if not target:
+        return ranked[:limit]
+    pool = list(ranked)
+    picked, counts, out = [], defaultdict(float), []
+    for _ in range(min(limit, len(pool))):
+        best, best_val, best_i = None, None, None
+        n = len(out) + 1
+        # Only the strongest remaining candidates are worth considering;
+        # scanning the whole tail each round is quadratic for no gain.
+        for i, item in enumerate(pool[:120]):
+            meta = item[1]
+            gs = meta.get("genres") or []
+            trial = dict(counts)
+            for g in gs:
+                trial[g] = trial.get(g, 0.0) + 1.0 / len(gs)
+            # KL(target || selected), smoothed so unseen genres don't blow up
+            kl = 0.0
+            for g, p in target.items():
+                q = (trial.get(g, 0.0) / n) * 0.99 + 0.01 * p
+                if q > 0:
+                    kl += p * math.log(p / q)
+            val = item[0] - lam * kl
+            if best_val is None or val > best_val:
+                best, best_val, best_i = item, val, i
+        if best is None:
+            break
+        out.append(best)
+        for g in (best[1].get("genres") or []):
+            counts[g] += 1.0 / len(best[1]["genres"])
+        pool.pop(best_i)
+    return out
+
+
 def score_candidates(profile, cand_metas, ctx, seed_hits=None,
                      require_released=True, exclude_ids=frozenset(),
-                     exclude_titles=frozenset()):
+                     exclude_titles=frozenset(), level=None, list_idx=None):
     """Ranked [(score, meta, reasons)] for candidate films.
 
     exclude_titles holds normalized titles of everything the user has
@@ -208,13 +329,17 @@ def score_candidates(profile, cand_metas, ctx, seed_hits=None,
             continue
         if require_released and not released(meta):
             continue
-        if (meta.get("vote_count") or 0) < 20:
+        if (meta.get("vote_count") or 0) < MIN_VOTES:
             continue
         vec = film_vector(meta, ctx)
         sim = cosine(profile, _norm(vec))
         hits = (seed_hits or {}).get(tid, 0)
-        s = sim * (0.6 + 0.4 * quality_prior(meta)) \
+        s = sim * (0.55 + 0.45 * quality_prior(meta)) \
                 * (1 + 0.06 * min(hits, 8))
+        if level is not None:
+            s *= level_fit(meta, level)
+        if list_idx:
+            s *= list_affinity(list_idx, meta)
         out.append((s, meta, _reasons(profile, vec)))
     out.sort(key=lambda t: -t[0])
     return out
@@ -222,7 +347,8 @@ def score_candidates(profile, cand_metas, ctx, seed_hits=None,
 
 def score_group(profiles, cand_metas, ctx, watched_keys, watchlist_keys,
                 title_index, seen_weight=0.0, seed_hits=None,
-                require_released=True, languages=None, availability=None):
+                require_released=True, languages=None, availability=None,
+                level=None, list_idx=None):
     """Rank candidates for a group of users.
 
     profiles         {username: taste vector}
@@ -238,7 +364,7 @@ def score_group(profiles, cand_metas, ctx, watched_keys, watchlist_keys,
     for tid, meta in cand_metas.items():
         if require_released and not released(meta):
             continue
-        if (meta.get("vote_count") or 0) < 20:
+        if (meta.get("vote_count") or 0) < MIN_VOTES:
             continue
         if languages and meta.get("original_language") not in languages:
             continue
@@ -264,8 +390,12 @@ def score_group(profiles, cand_metas, ctx, watched_keys, watchlist_keys,
         base *= 1 + 0.25 * len(wants) / len(users)      # on their watchlists
         if seen_by:
             base *= seen_weight ** (len(seen_by) / len(users))
-        s = base * (0.6 + 0.4 * quality_prior(meta)) \
+        s = base * (0.55 + 0.45 * quality_prior(meta)) \
                  * (1 + 0.05 * min((seed_hits or {}).get(tid, 0), 8))
+        if level is not None:
+            s *= level_fit(meta, level)
+        if list_idx:
+            s *= list_affinity(list_idx, meta)
         out.append({
             "score": s, "meta": meta,
             "seen_by": seen_by, "wants": wants,
@@ -282,6 +412,12 @@ def _reasons_multi(profiles, vec):
         for k, x in p.items():
             avg[k] += x / len(profiles)
     return _reasons(avg, vec)
+
+
+def list_affinity(idx, meta):
+    """How often this film shares Letterboxd lists with the user's films."""
+    from . import lists
+    return lists.boost(idx, norm_title(meta.get("title")))
 
 
 def _reasons(profile, vec):

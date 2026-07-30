@@ -151,7 +151,7 @@ def enrich_films(films, progress=None, workers=WORKERS):
             else:
                 misses.append(film.key)
             done += 1
-            if progress and done % 25 == 0:
+            if progress and (done % 20 == 0 or done == len(todo)):
                 progress(done, len(todo))
     conn.close()
     return enriched, misses
@@ -193,7 +193,7 @@ def candidates_for(seed_ids, workers=WORKERS):
     return result
 
 
-def enrich_ids(tmdb_ids, workers=WORKERS):
+def enrich_ids(tmdb_ids, workers=WORKERS, progress=None):
     """{tmdb_id: metadata} for known ids (no search step), cached + parallel."""
     conn = cache.connect()
     out, todo = {}, []
@@ -203,6 +203,7 @@ def enrich_ids(tmdb_ids, workers=WORKERS):
             out[tid] = hit
         else:
             todo.append(tid)
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_fetch_enrichment, tid): tid for tid in todo}
         for fut in as_completed(futures):
@@ -211,5 +212,8 @@ def enrich_ids(tmdb_ids, workers=WORKERS):
             if payload:
                 cache.put_film(conn, tid, payload)
                 out[tid] = payload
+            done += 1
+            if progress and (done % 20 == 0 or done == len(todo)):
+                progress(done, len(todo))
     conn.close()
     return out

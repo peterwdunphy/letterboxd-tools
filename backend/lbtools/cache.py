@@ -19,6 +19,16 @@ CREATE TABLE IF NOT EXISTS slug_map (
     slug TEXT PRIMARY KEY,
     tmdb_id INTEGER            -- NULL means "searched and found nothing"
 );
+CREATE TABLE IF NOT EXISTS film_lists (
+    slug TEXT PRIMARY KEY,         -- film slug -> JSON list of list URLs
+    payload TEXT NOT NULL,
+    fetched_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS list_films (
+    url TEXT PRIMARY KEY,          -- list URL -> JSON list of film slugs
+    payload TEXT NOT NULL,
+    fetched_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS recs (
     tmdb_id INTEGER PRIMARY KEY,   -- seed film
     payload TEXT NOT NULL,         -- JSON list of recommended/similar tmdb ids
@@ -64,4 +74,15 @@ def get_slug(conn, slug):
 
 def put_slug(conn, slug, tmdb_id):
     conn.execute("INSERT OR REPLACE INTO slug_map VALUES (?,?)", (slug, tmdb_id))
+    conn.commit()
+
+
+def get_json(conn, table, key_col, key):
+    row = conn.execute(f"SELECT payload FROM {table} WHERE {key_col}=?", (key,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def put_json(conn, table, key, payload):
+    conn.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,?)",
+                 (key, json.dumps(payload), time.time()))
     conn.commit()
