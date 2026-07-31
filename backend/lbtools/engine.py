@@ -87,7 +87,7 @@ BLOCK_NORM = 0.25
 # about (its themes and keywords), who made it, and what language it is
 # in — the things that separate arthouse animation from kids' fare.
 FEATURE_WEIGHTS = {"genre": 1.3, "theme": 2.0, "kw": 1.3, "dir": 2.5,
-                   "act": 1.0, "lang": 1.1, "dec": 0.75}
+                   "act": 1.0, "lang": 1.1, "dec": 0.75, "cert": 1.6}
 
 
 def _raw_features(meta, communities):
@@ -110,6 +110,9 @@ def _raw_features(meta, communities):
     rd = meta.get("release_date") or ""
     if len(rd) >= 4:
         v[f"dec:{rd[:3]}0s"] = 1.0
+    cert = meta.get("certification")
+    if cert:
+        v[f"cert:{cert}"] = 1.0
     return v
 
 

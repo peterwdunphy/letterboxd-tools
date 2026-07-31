@@ -181,6 +181,21 @@ def group(usernames, recency=0.5, source=0.35, seen_weight=0.0, limit=40,
                 pool[tid] += 2
                 wanted.add(tid)
 
+    # Same quality/register signals the single-user tool uses.
+    all_watched_meta = [m for _, (d, e) in users.items()
+                        for f in d.watched if (m := e.get(f.key))]
+    list_idx = {}
+    seeds = []
+    for name, (d, e) in users.items():
+        w = engine.watch_weights(d.watched, recency)
+        top = sorted((f for f in d.watched if f.slug and f.key in e),
+                     key=lambda f: -w[f.key])[:max(2, lists.MAX_SEEDS // len(users))]
+        seeds += [f.slug for f in top]
+    if seeds:
+        counts, used = lists.cooccurrence(seeds, progress=(
+            lambda s_, a, b: progress(s_, a, b)) if progress else None)
+        list_idx = lists.index(counts, used)
+
     trimmed = _trim_pool(pool, protected=wanted)
 
     def pc(done, total):
@@ -207,7 +222,8 @@ def group(usernames, recency=0.5, source=0.35, seen_weight=0.0, limit=40,
     ranked = engine.score_group(
         profiles, cand_metas, ctx, watched_keys, watchlist_keys, title_index,
         seen_weight=seen_weight, seed_hits=trimmed, languages=languages,
-        availability=availability)
+        availability=availability, level=engine.taste_level(all_watched_meta),
+        list_idx=list_idx)
 
     return {
         "usernames": list(usernames),

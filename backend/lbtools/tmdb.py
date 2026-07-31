@@ -21,6 +21,9 @@ from .config import tmdb_token
 WORKERS = 8
 
 API = "https://api.themoviedb.org/3"
+# Bump when the shape of a cached film payload changes; entries written by
+# an older version are refetched lazily rather than silently missing fields.
+SCHEMA_VERSION = 2
 POSTER_BASE = "https://image.tmdb.org/t/p/w342"
 
 
@@ -75,13 +78,36 @@ def _search(film):
     return best["id"] if best else None
 
 
+_CERT_ORDER = ("G", "PG", "PG-13", "R", "NC-17")
+
+
+def _us_certification(d):
+    """US theatrical rating, e.g. 'PG-13'. The strongest available signal
+    for who a film is *for*: it is what separates Grave of the Fireflies
+    from Captain Underpants when both are tagged Animation."""
+    for entry in (d.get("release_dates", {}) or {}).get("results", []):
+        if entry.get("iso_3166_1") != "US":
+            continue
+        certs = [r.get("certification") for r in entry.get("release_dates", [])
+                 if r.get("certification")]
+        for c in _CERT_ORDER:              # prefer a recognised rating
+            if c in certs:
+                return c
+        if certs:
+            return certs[0]
+    return None
+
+
 def _fetch_enrichment(tmdb_id):
     """Network-only: one API call for a film's full slimmed metadata."""
-    d = _get(f"/movie/{tmdb_id}", append_to_response="keywords,credits,watch/providers")
+    d = _get(f"/movie/{tmdb_id}",
+             append_to_response="keywords,credits,watch/providers,release_dates")
     if d is None:
         return None
     us = d.get("watch/providers", {}).get("results", {}).get("US", {})
     slim = {
+        "v": SCHEMA_VERSION,
+        "certification": _us_certification(d),
         "tmdb_id": tmdb_id,
         "title": d.get("title"),
         "original_language": d.get("original_language"),
@@ -128,7 +154,7 @@ def enrich_films(films, progress=None, workers=WORKERS):
                 tmdb_id = cached_id
         if tmdb_id:
             hit = cache.get_film(conn, tmdb_id)
-            if hit:
+            if hit and hit.get("v") == SCHEMA_VERSION:
                 enriched[film.key] = hit
                 continue
         todo.append((film, tmdb_id))
@@ -199,7 +225,7 @@ def enrich_ids(tmdb_ids, workers=WORKERS, progress=None):
     out, todo = {}, []
     for tid in tmdb_ids:
         hit = cache.get_film(conn, tid)
-        if hit:
+        if hit and hit.get("v") == SCHEMA_VERSION:
             out[tid] = hit
         else:
             todo.append(tid)
